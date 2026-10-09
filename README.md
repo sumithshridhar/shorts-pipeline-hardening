@@ -1,31 +1,112 @@
 # Shorts Pipeline Hardening
 
-Three modules from a Shorts content pipeline that runs on a scheduler with no one watching it. Each one exists because the pipeline broke in production first, in a way that looked fine in the logs.
+Three small Python modules that stop an unattended YouTube Shorts pipeline from reusing ids, losing its script queue, or publishing off-topic scripts.
 
-## 1. [`pipeline/script_ids.py`](pipeline/script_ids.py) — the bug that deleted a finished video and reported success
+They are taken from a private pipeline that runs on a scheduler. This repo holds only these modules and their tests. The editor, uploader and learning loop they work with are not included.
 
-The id allocator used to pick "the first gap in the script log." That log gets trimmed over time, so the first gap was an id the channel had *already used* — retired, not free.
+## In 30 seconds
 
-Here's what that actually did: the editor renders the video under the reused id, quality-checks it, approves it — and then the uploader's own orphan-cleanup step sees that id in its used-ids record, concludes the file is a leftover from a crashed run, and **deletes it**. The uploader then finds nothing left to upload, exits 0, and the pipeline counts the run as a successful upload. A fully rendered video, destroyed, logged as a win.
+| Module | Problem | Fix |
+|---|---|---|
+| [`script_ids.py`](pipeline/script_ids.py) | The old allocator took the first gap in the script log, which can be an id that was already used. The docstring traces what follows: the uploader's cleanup deletes the finished video, and the run still counts as a success. | Hand out ids above the highest id seen in any record. Never fill gaps. |
+| [`safe_write.py`](pipeline/safe_write.py) | `open(path, "w")` empties the file first. A crash mid-write leaves the script queue at 0 bytes. | Write a temp file, flush it to disk, then swap it in with `os.replace`. |
+| [`niche.py`](pipeline/niche.py) | A copied codebase kept the old channel's prompt, id prefix, tags and music. | Declare the channel's identity in one file, and check every script against it before it can be published. |
 
-The fix doesn't fill gaps at all — it allocates strictly above the highest id ever seen across every record the system keeps (the script log, the used-ids file, and the upload log), because a gap means retired, not available.
+## Why it matters
 
-## 2. [`pipeline/safe_write.py`](pipeline/safe_write.py) — the file that couldn't afford `open(path, "w")`
+When a job runs with nobody watching, the worst bugs are quiet ones. The logs look fine and the data is wrong. The comments at the top of each file describe the failure it was written for (in `niche.py`, problems the author says were found in production). The fixes are small, and each one is covered by tests.
 
-Most of this pipeline's state is disposable — videos re-render, stats re-fetch, dashboards regenerate. One file isn't: the script queue is the actual written work, and it was being saved with a plain `open(path, "w")` in three separate places.
+## How it fits together
 
-`"w"` mode truncates the file to zero bytes *before* writing the new content. A Ctrl+C, a killed process, a power cut, or the scheduled task ending mid-write in that window leaves a 0-byte file — every ready script, every held script, every "already used" marker, gone. And this particular write happens on every single pipeline round, so the window isn't rare, it's constant.
+```
+ records the pipeline keeps                     what the modules do
+ ───────────────────────────                    ───────────────────
+ scripts.md            (the queue)  ──┐
+ logs/used_posts.txt   (used ids)   ──┼──►  script_ids.next_free_id()  ──►  new ids, above all of these
+ logs/upload_log.txt   (uploads)    ──┘
 
-The fix: write to a sibling temp file, `fsync` it to disk, then `os.replace()` it over the target. `os.replace` is atomic on both Windows and POSIX when source and destination share a volume, which a sibling file always does — so a crash mid-write leaves either the complete old file or the complete new one, never a truncated one.
+ scripts.md  ◄──  safe_write.write_text_atomic()      (temp file ► flush ► os.replace)
 
-## 3. [`pipeline/niche.py`](pipeline/niche.py) — what happens when you copy a codebase without copying its assumptions
+ generated script  ──►  niche.check_script()  ──►  None (ok)  or  a reason to reject it
+```
 
-This pipeline's code was reused to spin up a second channel in a different content niche. Every hardcoded assumption from the first channel came along for the ride, and each one surfaced in production, not in testing: the generation prompt still asked for a personal secret, so the new channel auto-generated sentimental stories; the id prefix was hardcoded, so ids collided with the original channel's; tags and background music from the wrong niche shipped on real videos.
+## The three modules
 
-Every one of those was the same root cause — channel identity scattered across the codebase instead of declared in one place — so it's now declared in exactly one file, with a guard function that checks content two ways before it's allowed to reach the channel: it must *not* contain another niche's vocabulary, and it must *contain* this niche's. A one-directional blocklist isn't enough on its own — an early version of this guard happily accepted an off-topic script simply because it contained none of the banned words, which is why the second, positive check exists.
+### `pipeline/script_ids.py`
 
-The file also documents a real debugging call: when this channel's view count fell, the obvious suspect (a content pivot) turned out to be a red herring — the numbers had already started dropping a week *before* the pivot happened. Correlation pointed at the wrong cause, and the file records why, so the next person (also me) doesn't re-litigate it from scratch.
+`next_free_id(root, count)` returns the next `count` ids, for example `["s311", "s312"]`.
 
-## Why these three
+It reads three records under `root`:
 
-Nothing here is a tutorial pattern — each fix exists because a specific, real failure happened first: a video silently destroyed and logged as a success, a queue file that could be zeroed out by an interrupted write, and a copy-pasted codebase that let one channel post another's content. The code and the comments documenting *why* are exactly as they run in production, apart from anything that identifies the channel or its metrics beyond what's needed to tell the story.
+- `scripts.md`: lines that start with `id: s123`.
+- `logs/used_posts.txt`: one entry per line. Reddit post ids are mixed in and are ignored.
+- `logs/upload_log.txt`: lines containing `UPLOADED s123`.
+
+It returns ids above the highest one found. A gap means "retired", not "free", because retired ids are still referenced by the other records. The prefix (`s`) comes from `niche.ID_PREFIX`, so a second channel gets its own id space. Without a `niche` module it falls back to `s`.
+
+### `pipeline/safe_write.py`
+
+```python
+from safe_write import write_text_atomic
+write_text_atomic("scripts.md", text)
+```
+
+It writes `.scripts.md.tmp` in the same folder, calls `fsync`, then `os.replace`s it over the target. If the process dies, the target is either the old complete file or the new complete file. On POSIX the replace is atomic. On Windows it is a single replace call, which Python does not document as atomic.
+
+`newline=None` (the default) behaves like a plain `open(path, "w")`, so on Windows `\n` is still written as `\r\n`. Pass `newline=""` for byte-exact output.
+
+### `pipeline/niche.py`
+
+One file that declares the channel: name, id prefix, hashtags, tags, call-to-action lines and content rules.
+
+`check_script(text)` returns `None` when a script fits the channel, or a reason string when it does not. It checks both ways:
+
+- The script must not contain another niche's vocabulary (`FOREIGN_TERMS`) or a forbidden claim (`FORBIDDEN_CLAIMS`).
+- The script must contain a relationship phrase such as "my mother" (`REQUIRED_TERMS`).
+
+The second check exists because a blocklist alone accepted an off-topic script that simply used none of the banned words.
+
+The file also holds one rule that the code cannot enforce by itself: `SOURCE_REQUIRED = True`. A first-person story may only be published if it retells a real, credited source. Nothing in this repo checks that flag.
+
+## Run the tests
+
+Standard library only. No install step. Written and run with Python 3.13.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Expected result: `OK (expected failures=6)`.
+
+The 6 expected failures are tests of the limitations listed below. They fail today on purpose. When a limitation is fixed, its test starts to pass, and `unittest` then reports it as an unexpected success so the decorator can be removed.
+
+## Known limitations
+
+Found while reviewing the code. None of them is fixed in this repo yet.
+
+- **`check_script` matches substrings, not words.**
+  - "skill" trips the forbidden word "kill", and "paradox" trips "dox".
+  - "in my experience", "my song" and "my moment" count as relationships, because they contain "my ex", "my son" and "my mom".
+  - A foreign term right after a quote or bracket (`"recipe`) is not caught, because those terms only match after a space.
+- **`script_ids` ignores a record it cannot read.** A locked or unreadable `used_posts.txt` is treated as empty. The ids in it can then be handed out again, which is the bug the module exists to prevent. A missing file is fine; an unreadable one should raise.
+- **Two callers can get the same ids.** `learn.py` and `comment_loop.py` both allocate ids (per the docstring), and nothing locks the allocation.
+- **`safe_write` leaves its temp file behind if a write fails.** The temp name is fixed, so two writers to the same file at once can collide. On Windows, `os.replace` raises `PermissionError` if another program has the target open. There is no retry.
+
+## About the source
+
+- The code comments mention files that are not in this repo (`editor`, `uploader`, `learn.py`, `comment_loop.py`, `experiments.md`, `playbook.md`).
+- `niche.py` includes the channel's name and some audience figures in its comments. They are the author's own notes and cannot be checked from this repo.
+
+## Layout
+
+```
+pipeline/
+  niche.py         channel identity and the check_script() guard
+  safe_write.py    atomic text writes
+  script_ids.py    id allocation
+tests/
+  _paths.py        puts pipeline/ on sys.path for the tests
+  test_niche.py
+  test_safe_write.py
+  test_script_ids.py
+```
